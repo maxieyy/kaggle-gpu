@@ -1,13 +1,14 @@
-# Fresh-Install `llama.cpp` CUDA Build for Kaggle Notebook (Qwen3 Thinking + Cloudflare Tunnel)
+# Self-host Qwen3.8-27B-Turbo-Brilliance-50X-Reasoning-Instruct-NEO-MAX-MTP-GGUF on Kaggle T4 × 2 GPU
 
 This notebook is the **fresh-install** version for a new Kaggle notebook. It:
 
-1. Clones [`llama.cpp`](https://github.com/ggml-org/llama.cpp) from GitHub and compiles the **CUDA server from source** — no precompiled runtime Dataset is used.
-2. Downloads **Qwen3 Thinking** from Hugging Face.
+1. Pulls Pre-complied llama-server.
+2. Downloads **Qwen3.8-27B-Turbo-Brilliance-50X-Reasoning-Instruct-NEO-MAX-MTP-GGUF** by `DavidAU` from `Hugging Face`.
 3. Serves it through **OpenAI-compatible** and **Anthropic-compatible** endpoints.
 4. Connects a **Cloudflare Tunnel**.
 
-The build settings follow the official [`llama.cpp` CUDA build guide](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md).
+
+
 
 ---
 
@@ -21,7 +22,7 @@ In Kaggle, create a new notebook and configure:
 | **Internet** | On |
 | **Secrets** | `LLAMA_API_KEY` and `CF_TUNNEL_TOKEN`, both enabled for notebook access |
 
-We use **`Qwen3-30B-A3B-Thinking-2507-Q3_K_S.gguf`**, listed at **13.292 GB**. This quantization fits the download/storage budget better than `Q4_K_M`, though with a greater quality trade-off.
+We use **`Qwen3.8-27B-Turbo-Brilliance-50X-Reasoning-Instruct-NEO-MAX-MTP-GGUF`**, listed at **17.1 GB**. This quantization fits the download/storage budget, though with a greater quality trade-off. Tested on GPU T4 × 2 and produced ~10-20 tokens/sec on Small tasks on full 256K context and 1 parallel. More than 1 parallel and it crashes. Output is brilliance  but on Long running process model seems to "Hallucinate" it keeps repeating itself in loop.
 
 ---
 
@@ -37,7 +38,7 @@ from pathlib import Path
 print("Python:", sys.version)
 print("Working directory:", Path("/kaggle/working"))
 
-# Verify that Kaggle gave this notebook GPU access.
+
 subprocess.run(["nvidia-smi"], check=True)
 
 NVCC = shutil.which("nvcc")
@@ -94,11 +95,11 @@ print("Build dependencies installed.")
 
 ---
 
-## Cell 3 — Clone and compile `llama.cpp`
+## Cell 3 — Clone compiled `llama.cpp`
 
-This compiles specifically for the Tesla T4's CUDA compute capability **7.5**. It uses **two build jobs** to limit memory pressure.
+This compiles specifically for the Tesla T4's CUDA compute capability **7.5**. It's already prebuilt
 
-After compiling, it keeps the runnable server and its shared libraries, and removes the source/build intermediates to free disk space for the model.
+
 
 ```python
 import os
@@ -106,97 +107,139 @@ import shutil
 import subprocess
 from pathlib import Path
 
-REPO_DIR = Path("/kaggle/working/llama.cpp")
-BUILD_DIR = REPO_DIR / "build"
-BUILD_BIN = BUILD_DIR / "bin"
-RUNTIME_DIR = Path("/kaggle/working/llama-runtime")
-RUNTIME_BIN = RUNTIME_DIR / "bin"
-RUNTIME_SERVER = RUNTIME_BIN / "llama-server"
+SD_DIR = Path("/kaggle/working/stable-diffusion.cpp")
+SD_BUILD = SD_DIR / "build"
+BUILD_BIN = SD_BUILD / "bin"
 
-# Clone if not already present.
-if not REPO_DIR.is_dir():
-    subprocess.run(
-        [
-            "git", "clone", "--depth", "1",
-            "https://github.com/ggml-org/llama.cpp.git",
-            str(REPO_DIR),
-        ],
-        check=True,
+RUNTIME_ROOT = Path("/kaggle/working/sdcpp-runtime")
+RUNTIME_BIN = RUNTIME_ROOT / "bin"
+SD_SERVER = RUNTIME_BIN / "sd-server"
+
+shutil.rmtree(SD_DIR, ignore_errors=True)
+
+subprocess.run(
+    [
+        "git", "clone", "--recursive",
+        "https://github.com/leejet/stable-diffusion.cpp",
+        str(SD_DIR),
+    ],
+    check=True,
+)
+commit_date = subprocess.run(
+    ["git", "log", "-1", "--format=%cs"],
+    cwd=SD_DIR,
+    capture_output=True,
+    text=True,
+    check=True,
+).stdout.strip()
+
+commit_hash = subprocess.run(
+    ["git", "rev-parse", "--short", "HEAD"],
+    cwd=SD_DIR,
+    capture_output=True,
+    text=True,
+    check=True,
+).stdout.strip()
+
+print("Source commit:", commit_hash)
+print("Commit date:", commit_date)
+
+if commit_date < "2026-10-06":
+    raise RuntimeError(
+        "The checked-out source is older than 2026-10-06. "
+        "Update stable-diffusion.cpp before building."
     )
 
-# Configure the CUDA build for T4 (compute capability 7.5).
 subprocess.run(
     [
         "cmake",
-        "-S", str(REPO_DIR),
-        "-B", str(BUILD_DIR),
-        "-DGGML_CUDA=ON",
-        "-DCMAKE_CUDA_ARCHITECTURES=75",
-        "-DLLAMA_CURL=ON",
+        "-S", str(SD_DIR),
+        "-B", str(SD_BUILD),
+        "-DSD_CUDA=ON",
+        "-DSD_BUILD_EXAMPLES=ON",
+        "-DSD_SERVER_BUILD_FRONTEND=OFF",
         "-DCMAKE_BUILD_TYPE=Release",
+        "-DCMAKE_CUDA_ARCHITECTURES=75",
     ],
     check=True,
 )
 
-# Build with two jobs to limit memory pressure on the T4 host.
 subprocess.run(
     [
-        "cmake",
-        "--build", str(BUILD_DIR),
+        "cmake", "--build", str(SD_BUILD),
         "--config", "Release",
-        "--target", "llama-server",
+        "--target", "sd-server",
         "-j", "2",
     ],
     check=True,
 )
 
-built_server = BUILD_BIN / "llama-server"
-assert built_server.is_file(), (
-    f"Compilation succeeded but server is missing: {built_server}"
-)
+built_server = BUILD_BIN / "sd-server"
+assert built_server.is_file(), f"Missing build output: {built_server}"
 
-# Verify the compiled binary before removing build intermediates.
 build_env = os.environ.copy()
 build_env["LD_LIBRARY_PATH"] = (
-    str(BUILD_BIN)
-    + os.pathsep
+    str(BUILD_BIN) + os.pathsep
     + build_env.get("LD_LIBRARY_PATH", "")
 )
 
 subprocess.run(
-    [str(built_server), "--version"],
-    check=True,
+    [str(built_server), "--help"],
     env=build_env,
+    check=False,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
 )
+
+shutil.rmtree(RUNTIME_ROOT, ignore_errors=True)
+RUNTIME_BIN.mkdir(parents=True, exist_ok=True)
+
+shutil.copytree(
+    BUILD_BIN,
+    RUNTIME_BIN,
+    symlinks=True,
+    dirs_exist_ok=True,
+)
+
+SD_SERVER = RUNTIME_BIN / "sd-server"
+assert SD_SERVER.is_file(), "sd-server was not restored."
+
+runtime_env = os.environ.copy()
+runtime_env["LD_LIBRARY_PATH"] = (
+    str(RUNTIME_BIN) + os.pathsep
+    + runtime_env.get("LD_LIBRARY_PATH", "")
+)
+os.environ["LD_LIBRARY_PATH"] = runtime_env["LD_LIBRARY_PATH"]
+
+deps = subprocess.run(
+    ["ldd", str(SD_SERVER)],
+    capture_output=True,
+    text=True,
+    env=runtime_env,
+)
+
+dependency_output = deps.stdout + deps.stderr
+print(dependency_output)
+
+if "not found" in dependency_output or "file too short" in dependency_output:
+    raise RuntimeError("The compiled server has missing or broken libraries.")
 
 subprocess.run(
-    [str(built_server), "--list-devices"],
+    [str(SD_SERVER), "--help"],
+    env=runtime_env,
     check=True,
-    env=build_env,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
 )
+shutil.rmtree(SD_DIR, ignore_errors=True)
 
-# Move the complete runtime directory, preserving the libraries
-# and symlinks beside the executable.
-shutil.rmtree(RUNTIME_DIR, ignore_errors=True)
-RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-shutil.move(str(BUILD_BIN), str(RUNTIME_BIN))
-
-# Free the repository, object files, and intermediate build files.
-shutil.rmtree(REPO_DIR, ignore_errors=True)
-
-LLAMA_SERVER = RUNTIME_SERVER
-assert LLAMA_SERVER.is_file(), "llama-server was not created."
-
-os.environ["LD_LIBRARY_PATH"] = (
-    str(RUNTIME_BIN)
-    + os.pathsep
-    + os.environ.get("LD_LIBRARY_PATH", "")
+print("\nCUDA image server compiled successfully.")
+print("Server:", SD_SERVER)
+print(
+    "Free disk space:",
+    f"{shutil.disk_usage('/kaggle/working').free / (1024**3):.2f} GiB",
 )
-
-print("\nFresh CUDA build ready:", LLAMA_SERVER)
 ```
-
-> If compilation fails, the cell stops and shows the CMake or compiler error. **Fix that error before moving on.**
 
 ---
 
@@ -243,59 +286,83 @@ This cell verifies that the build can run and that **both CUDA devices** are vis
 
 ## Cell 5 — Download the Thinking model
 
-The selected public repository is **`tensorblock/Qwen_Qwen3-30B-A3B-Thinking-2507-GGUF`**. The exact `Q3_K_S` filename is listed in its model files.
+The selected public repository is **`DavidAU/Qwen3.8-27B-Turbo-Brilliance-50X-Reasoning-Instruct-NEO-MAX-MTP-GGUF`**. The exact `Q4_K_M` filename is listed in its model files.
 
 ```python
 import os
 import sys
-import subprocess
-from pathlib import Path
 import shutil
+import subprocess
+import importlib.util
+from pathlib import Path
 
-try:
-    from huggingface_hub import hf_hub_download
-except ImportError:
-    subprocess.run(
-        [
-            sys.executable, "-m", "pip", "install", "-q",
-            "huggingface_hub",
-        ],
-        check=True,
-    )
-    from huggingface_hub import hf_hub_download
-
-MODEL_REPO = (
-    "tensorblock/Qwen_Qwen3-30B-A3B-Thinking-2507-GGUF"
-)
-MODEL_FILE = "Qwen3-30B-A3B-Thinking-2507-Q3_K_S.gguf"
 MODEL_DIR = Path("/kaggle/working/models")
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+MODEL_REPO = (
+    "DavidAU/"
+    "Qwen3.8-27B-Turbo-Brilliance-50X-Reasoning-Instruct-NEO-MAX-MTP-GGUF"
+)
+
+MODEL_FILE = (
+    "Qwen3.8-27B-Turbo-Brilliance-50X-RI-NEO-MAX-MTP-Q4_K_M.gguf"
+)
+
 MODEL_PATH = MODEL_DIR / MODEL_FILE
 
-free_gib = shutil.disk_usage(MODEL_DIR).free / (1024 ** 3)
-print(f"Free space before download: {free_gib:.2f} GiB")
+# Disable Xet's separate chunk cache to reduce additional disk consumption.
+os.environ["HF_HUB_DISABLE_XET"] = "1"
 
-if not MODEL_PATH.is_file():
-    if free_gib < 14:
-        raise RuntimeError(
-            "Not enough free disk space to download Q3_K_S safely."
-        )
-    print("Downloading Thinking GGUF from Hugging Face...")
+if importlib.util.find_spec("huggingface_hub") is None:
+    subprocess.run(
+        [
+            sys.executable, "-m", "pip", "install",
+            "--no-cache-dir", "huggingface_hub"
+        ],
+        check=True
+    )
+
+from huggingface_hub import hf_hub_download
+
+free_gib = shutil.disk_usage(MODEL_DIR).free / (1024**3)
+print(f"Available before model download: {free_gib:.2f} GiB")
+
+if free_gib < 17.5 and not MODEL_PATH.exists():
+    raise RuntimeError(
+        "Not enough free disk for this download. "
+        "Use the smaller Q4_K_M variant shown in the fallback below."
+    )
+
+if MODEL_PATH.exists() and MODEL_PATH.stat().st_size > 16 * 1024**3:
+    print("Model file already exists; skipping download.")
+else:
+    print("Downloading the Turbo Brilliance Q4_K_M model...")
+    print("Keep this notebook session running until the download finishes.")
+
     downloaded_path = hf_hub_download(
         repo_id=MODEL_REPO,
         filename=MODEL_FILE,
-        local_dir=str(MODEL_DIR),
+        local_dir=str(MODEL_DIR)
     )
+
     MODEL_PATH = Path(downloaded_path)
 
-assert MODEL_PATH.is_file(), "Model download failed."
+if not MODEL_PATH.exists():
+    raise RuntimeError("Model file was not found after downloading.")
 
-print("\nModel ready:", MODEL_PATH)
-print(f"Model size: {MODEL_PATH.stat().st_size / (1024**3):.2f} GiB")
+size_gib = MODEL_PATH.stat().st_size / (1024**3)
+print(f"\nModel saved: {MODEL_PATH}")
+print(f"Model size: {size_gib:.2f} GiB")
 print(
-    f"Remaining space: "
-    f"{shutil.disk_usage(MODEL_DIR).free / (1024**3):.2f} GiB"
+    "Remaining disk:",
+    f"{shutil.disk_usage('/kaggle/working').free / (1024**3):.2f} GiB"
 )
+
+if size_gib < 16:
+    raise RuntimeError(
+        "Downloaded file is unexpectedly small. "
+        "Check whether the download completed."
+    )
 ```
 
 ---
@@ -388,7 +455,7 @@ else:
     raise RuntimeError("Timed out waiting for llama-server to start.")
 ```
 
-> **Note:** 256K is the *requested* context size, not a guarantee that it fits. If loading fails with CUDA out-of-memory, inspect `/tmp/llama-server.log`. The quantized cache reduces memory use, but the GPU allocation can still fail on two T4s.
+> **Note:** 256K is the *requested* context size, not a guarantee that it fits. If loading fails with CUDA out-of-memory, inspect `/tmp/llama-server.log`. The quantized cache reduces memory use, but the GPU allocation can still fail on two T4s. Reduce to 128K and 1 parallel process.
 
 ---
 
